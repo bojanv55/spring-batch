@@ -16,45 +16,40 @@
 
 package org.springframework.batch.core.launch;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-
 import org.junit.Before;
 import org.junit.Test;
-import org.springframework.batch.core.BatchStatus;
-import org.springframework.batch.core.ExitStatus;
-import org.springframework.batch.core.Job;
-import org.springframework.batch.core.JobExecution;
-import org.springframework.batch.core.JobInstance;
-import org.springframework.batch.core.JobParameters;
-import org.springframework.batch.core.JobParametersBuilder;
-import org.springframework.batch.core.JobParametersInvalidException;
-import org.springframework.batch.core.JobParametersValidator;
-import org.springframework.batch.core.StepExecution;
+import org.springframework.batch.core.*;
 import org.springframework.batch.core.job.DefaultJobParametersValidator;
 import org.springframework.batch.core.job.JobSupport;
+import org.springframework.batch.core.launch.support.FaultTolerantJobLauncher;
 import org.springframework.batch.core.launch.support.SimpleJobLauncher;
 import org.springframework.batch.core.repository.JobExecutionAlreadyRunningException;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.repository.JobRestartException;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.core.task.TaskRejectedException;
+import org.springframework.retry.backoff.FixedBackOffPolicy;
+import org.springframework.retry.policy.SimpleRetryPolicy;
+import org.springframework.retry.support.RetryTemplate;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+import static org.junit.Assert.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * @author Lucas Ward
  * @author Will Schipp
  *
  */
-public class SimpleJobLauncherTests {
+public class FaultTolerantJobLauncherTests {
 
-	private SimpleJobLauncher jobLauncher;
+	private FaultTolerantJobLauncher jobLauncher;
+
+	private RetryTemplate retryTemplate;
 
 	private JobSupport job = new JobSupport("foo") {
 		@Override
@@ -71,7 +66,16 @@ public class SimpleJobLauncherTests {
 	@Before
 	public void setUp() throws Exception {
 
-		jobLauncher = new SimpleJobLauncher();
+		retryTemplate = new RetryTemplate();
+		FixedBackOffPolicy backOffPolicy = new FixedBackOffPolicy();
+		backOffPolicy.setBackOffPeriod(1);
+		SimpleRetryPolicy retryPolicy = new SimpleRetryPolicy();
+		retryPolicy.setMaxAttempts(2);
+		retryTemplate.setRetryPolicy(retryPolicy);
+		retryTemplate.setBackOffPolicy(backOffPolicy);
+
+		jobLauncher = new FaultTolerantJobLauncher();
+		jobLauncher.setRetryTemplate(retryTemplate);
 		jobRepository = mock(JobRepository.class);
 		jobLauncher.setJobRepository(jobRepository);
 
@@ -166,16 +170,24 @@ public class SimpleJobLauncherTests {
 	@Test
 	public void testTaskExecutorRejects() throws Exception {
 
+		JobExecution jobExecution = new JobExecution((JobInstance) null, (JobParameters) null);
+
 		final List<String> list = new ArrayList<String>();
 		jobLauncher.setTaskExecutor(new TaskExecutor() {
 			@Override
 			public void execute(Runnable task) {
-				list.add("execute");
-				throw new TaskRejectedException("Planned failure");
+				try {
+					list.add("execute");
+					throw new TaskRejectedException("Planned failure");
+				} catch (TaskRejectedException e) {
+					jobExecution.upgradeStatus(BatchStatus.FAILED);
+					if (jobExecution.getExitStatus().equals(ExitStatus.UNKNOWN)) {
+						jobExecution.setExitStatus(ExitStatus.FAILED.addExitDescription(e));
+					}
+					jobRepository.update(jobExecution);
+				}
 			}
 		});
-
-		JobExecution jobExecution = new JobExecution((JobInstance) null, (JobParameters) null);
 
 		when(jobRepository.getLastJobExecution(job.getName(), jobParameters)).thenReturn(null);
 		when(jobRepository.createJobExecution(job.getName(), jobParameters)).thenReturn(jobExecution);
@@ -208,7 +220,7 @@ public class SimpleJobLauncherTests {
 			fail("Expected RuntimeException");
 		}
 		catch (RuntimeException e) {
-			assertEquals("foo", e.getMessage());
+			assertEquals("Retry exhausted after last attempt with no recovery path.; nested exception is java.lang.RuntimeException: foo", e.getMessage());
 		}
 	}
 
@@ -225,7 +237,7 @@ public class SimpleJobLauncherTests {
 			run(ExitStatus.FAILED);
 			fail("Expected Error");
 		}
-		catch (Error e) {
+		catch (RuntimeException e) {
 			assertEquals("Retry exhausted after last attempt with no recovery path.; nested exception is java.lang.Error: foo", e.getMessage());
 		}
 	}
@@ -245,7 +257,8 @@ public class SimpleJobLauncherTests {
 
 	@Test
 	public void testInitialiseWithRepository() throws Exception {
-		jobLauncher = new SimpleJobLauncher();
+		jobLauncher = new FaultTolerantJobLauncher();
+		jobLauncher.setRetryTemplate(retryTemplate);
 		jobLauncher.setJobRepository(jobRepository);
 		jobLauncher.afterPropertiesSet(); // no error
 	}
@@ -310,7 +323,8 @@ public class SimpleJobLauncherTests {
 		when(jobExecution.getStepExecutions()).thenReturn(Arrays.asList(stepExecution));
 
 		//setup launcher
-		jobLauncher = new SimpleJobLauncher();
+		jobLauncher = new FaultTolerantJobLauncher();
+		jobLauncher.setRetryTemplate(retryTemplate);
 		jobLauncher.setJobRepository(jobRepository);
 
 		//run
